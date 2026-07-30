@@ -1,0 +1,499 @@
+package ruler
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net/url"
+
+	"time"
+
+	"github.com/go-kit/log"
+	"github.com/go-kit/log/level"
+	"github.com/google/uuid"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/prometheus/model/exemplar"
+	"github.com/prometheus/prometheus/model/histogram"
+	"github.com/prometheus/prometheus/model/labels"
+	"github.com/prometheus/prometheus/model/metadata"
+	"github.com/prometheus/prometheus/notifier"
+	"github.com/prometheus/prometheus/promql"
+	"github.com/prometheus/prometheus/rules"
+	"github.com/prometheus/prometheus/storage"
+	"github.com/prometheus/prometheus/util/strutil"
+	"github.com/weaveworks/common/httpgrpc"
+	"github.com/weaveworks/common/user"
+
+	"github.com/cortexproject/cortex/pkg/cortexpb"
+	cortexparser "github.com/cortexproject/cortex/pkg/parser"
+	"github.com/cortexproject/cortex/pkg/querier"
+	"github.com/cortexproject/cortex/pkg/querier/stats"
+	"github.com/cortexproject/cortex/pkg/ring/client"
+	util_log "github.com/cortexproject/cortex/pkg/util/log"
+	promql_util "github.com/cortexproject/cortex/pkg/util/promql"
+	"github.com/cortexproject/cortex/pkg/util/requestmeta"
+	"github.com/cortexproject/cortex/pkg/util/validation"
+)
+
+// Pusher is an ingester server that accepts pushes.
+type Pusher interface {
+	Push(context.Context, *cortexpb.WriteRequest) (*cortexpb.WriteResponse, error)
+}
+
+type PusherAppender struct {
+	failedWrites prometheus.Counter
+	totalWrites  prometheus.Counter
+
+	ctx             context.Context
+	pusher          Pusher
+	labels          []labels.Labels
+	samples         []cortexpb.Sample
+	histogramLabels []labels.Labels
+	histograms      []cortexpb.WrappedHistogram
+	userID          string
+	opts            *storage.AppendOptions
+}
+
+func (a *PusherAppender) AppendHistogram(_ storage.SeriesRef, l labels.Labels, t int64, h *histogram.Histogram, fh *histogram.FloatHistogram) (storage.SeriesRef, error) {
+	if h == nil && fh == nil {
+		return 0, errors.New("no histogram")
+	}
+	if h != nil {
+		a.histograms = append(a.histograms, cortexpb.WrappedHistogram{Histogram: cortexpb.HistogramToHistogramProto(t, h)})
+	} else {
+		a.histograms = append(a.histograms, cortexpb.WrappedHistogram{Histogram: cortexpb.FloatHistogramToHistogramProto(t, fh)})
+	}
+	a.histogramLabels = append(a.histogramLabels, l)
+	return 0, nil
+}
+
+func (a *PusherAppender) Append(_ storage.SeriesRef, l labels.Labels, t int64, v float64) (storage.SeriesRef, error) {
+	a.labels = append(a.labels, l)
+	a.samples = append(a.samples, cortexpb.Sample{
+		TimestampMs: t,
+		Value:       v,
+	})
+	return 0, nil
+}
+
+func (a *PusherAppender) SetOptions(opts *storage.AppendOptions) {
+	a.opts = opts
+}
+
+func (a *PusherAppender) AppendHistogramSTZeroSample(ref storage.SeriesRef, l labels.Labels, t, ct int64, h *histogram.Histogram, fh *histogram.FloatHistogram) (storage.SeriesRef, error) {
+	// AppendHistogramSTZeroSample is a no-op for PusherAppender as it happens during scrape time only.
+	return 0, nil
+}
+
+func (a *PusherAppender) AppendSTZeroSample(_ storage.SeriesRef, _ labels.Labels, _, _ int64) (storage.SeriesRef, error) {
+	// AppendSTZeroSample is a no-op for PusherAppender as it happens during scrape time only.
+	return 0, nil
+}
+
+func (a *PusherAppender) AppendExemplar(_ storage.SeriesRef, _ labels.Labels, _ exemplar.Exemplar) (storage.SeriesRef, error) {
+	return 0, errors.New("exemplars are unsupported")
+}
+
+func (a *PusherAppender) Commit() error {
+	a.totalWrites.Inc()
+
+	req := cortexpb.ToWriteRequest(a.labels, a.samples, nil, nil, cortexpb.RULE)
+	req.AddHistogramTimeSeries(a.histogramLabels, a.histograms)
+
+	// Set DiscardOutOfOrder flag if requested via AppendOptions
+	if a.opts != nil && a.opts.DiscardOutOfOrder {
+		req.DiscardOutOfOrder = true
+	}
+
+	// Since a.pusher is distributor, client.ReuseSlice will be called in a.pusher.Push.
+	// We shouldn't call client.ReuseSlice here.
+	_, err := a.pusher.Push(user.InjectOrgID(a.ctx, a.userID), req)
+	if err != nil {
+		// Don't report errors that ended with 4xx HTTP status code (series limits, duplicate samples, out of order, etc.)
+		if resp, ok := httpgrpc.HTTPResponseFromError(err); !ok || resp.Code/100 == 5 {
+			a.failedWrites.Inc()
+		}
+	}
+
+	a.labels = nil
+	a.samples = nil
+	a.histogramLabels = nil
+	a.histograms = nil
+	return err
+}
+
+func (a *PusherAppender) UpdateMetadata(_ storage.SeriesRef, _ labels.Labels, _ metadata.Metadata) (storage.SeriesRef, error) {
+	return 0, errors.New("update metadata unsupported")
+}
+
+func (a *PusherAppender) Rollback() error {
+	a.labels = nil
+	a.samples = nil
+	a.histogramLabels = nil
+	a.histograms = nil
+	return nil
+}
+
+// PusherAppendable fulfills the storage.Appendable interface for prometheus manager
+type PusherAppendable struct {
+	pusher      Pusher
+	userID      string
+	rulesLimits RulesLimits
+
+	totalWrites  prometheus.Counter
+	failedWrites prometheus.Counter
+}
+
+func NewPusherAppendable(pusher Pusher, userID string, limits RulesLimits, totalWrites, failedWrites prometheus.Counter) *PusherAppendable {
+	return &PusherAppendable{
+		pusher:       pusher,
+		userID:       userID,
+		rulesLimits:  limits,
+		totalWrites:  totalWrites,
+		failedWrites: failedWrites,
+	}
+}
+
+// Appender returns a storage.Appender
+func (t *PusherAppendable) Appender(ctx context.Context) storage.Appender {
+	return &PusherAppender{
+		failedWrites: t.failedWrites,
+		totalWrites:  t.totalWrites,
+
+		ctx:    ctx,
+		pusher: t.pusher,
+		userID: t.userID,
+	}
+}
+
+// RulesLimits defines limits used by Ruler.
+type RulesLimits interface {
+	MaxQueryLength(userID string) time.Duration
+	RulerTenantShardSize(userID string) float64
+	RulerMaxRuleGroupsPerTenant(userID string) int
+	RulerMaxRulesPerRuleGroup(userID string) int
+	RulerQueryOffset(userID string) time.Duration
+	DisabledRuleGroups(userID string) validation.DisabledRuleGroups
+	RulerExternalLabels(userID string) labels.Labels
+	RulerExternalURL(userID string) string
+	RulerAlertGeneratorURLTemplate(userID string) string
+}
+
+type QueryExecutor func(ctx context.Context, qs string, t time.Time) (promql.Vector, error)
+
+func engineQueryFunc(engine promql.QueryEngine, frontendClient *frontendClient, q storage.Queryable, overrides RulesLimits, userID string, lookbackDelta time.Duration) rules.QueryFunc {
+	var executor QueryExecutor
+
+	if frontendClient != nil {
+		// query to query frontend
+		executor = frontendClient.InstantQuery
+	} else {
+		// query to engine
+		executor = func(ctx context.Context, qs string, t time.Time) (promql.Vector, error) {
+			return executeQuery(ctx, engine, q, qs, t)
+		}
+	}
+
+	return wrapWithMiddleware(executor, overrides, userID, lookbackDelta)
+}
+
+func executeQuery(ctx context.Context, engine promql.QueryEngine, q storage.Queryable, qs string, t time.Time) (promql.Vector, error) {
+	qry, err := engine.NewInstantQuery(ctx, q, nil, qs, t)
+	if err != nil {
+		return nil, err
+	}
+	defer qry.Close()
+
+	res := qry.Exec(ctx)
+	if res.Err != nil {
+		return nil, res.Err
+	}
+
+	switch v := res.Value.(type) {
+	case promql.Vector:
+		return v, nil
+	case promql.Scalar:
+		return promql.Vector{promql.Sample{
+			T:      v.T,
+			F:      v.V,
+			Metric: labels.Labels{},
+		}}, nil
+	default:
+		return nil, errors.New("rule result is not a vector or scalar")
+	}
+}
+
+func wrapWithMiddleware(next QueryExecutor, overrides RulesLimits, userID string, lookbackDelta time.Duration) rules.QueryFunc {
+	return func(ctx context.Context, qs string, t time.Time) (promql.Vector, error) {
+		// Enforce the max query length.
+		maxQueryLength := overrides.MaxQueryLength(userID)
+		if maxQueryLength > 0 {
+			expr, err := cortexparser.ParseExpr(qs)
+			// If failed to parse expression, skip checking select range.
+			// Fail the query in the engine.
+			if err == nil {
+				// Enforce query length across all selectors in the query.
+				length := promql_util.FindNonOverlapQueryLength(expr, 0, 0, lookbackDelta)
+				if length > maxQueryLength {
+					return nil, validation.LimitError(fmt.Sprintf(validation.ErrQueryTooLong, length, maxQueryLength))
+				}
+			}
+		}
+
+		// Add request ID to the context so that it can be used in logs and metrics for split queries.
+		if requestmeta.RequestIdFromContext(ctx) == "" {
+			ctx = requestmeta.ContextWithRequestId(ctx, uuid.NewString())
+		}
+		ctx = requestmeta.ContextWithRequestSource(ctx, requestmeta.SourceRuler)
+
+		return next(ctx, qs, t)
+	}
+}
+
+func metricsQueryFunc(qf rules.QueryFunc, queries, failedQueries prometheus.Counter) rules.QueryFunc {
+	return func(ctx context.Context, qs string, t time.Time) (promql.Vector, error) {
+		queries.Inc()
+		result, err := qf(ctx, qs, t)
+
+		// We only care about errors returned by underlying Queryable. Errors returned by PromQL engine are "user-errors",
+		// and not interesting here.
+		qerr := QueryableError{}
+		if err != nil && errors.As(err, &qerr) {
+			origErr := qerr.Unwrap()
+
+			// Not all errors returned by Queryable are interesting, only those that would result in 500 status code.
+			//
+			// We rely on TranslateToPromqlApiError to do its job here... it returns nil, if err is nil.
+			// It returns promql.ErrStorage, if error should be reported back as 500.
+			// Other errors it returns are either for canceled or timed-out queriers (we're not reporting those as failures),
+			// or various user-errors (limits, duplicate samples, etc. ... also not failures).
+			//
+			// All errors will still be counted towards "evaluation failures" metrics and logged by Prometheus Ruler,
+			// but we only want internal errors here.
+			if _, ok := querier.TranslateToPromqlAPIError(origErr).(promql.ErrStorage); ok {
+				failedQueries.Inc()
+			}
+
+			// Return unwrapped error.
+			return result, origErr
+		}
+
+		return result, err
+	}
+}
+
+func recordAndReportRuleQueryMetrics(qf rules.QueryFunc, userID string, evalMetrics *RuleEvalMetrics, logger log.Logger) rules.QueryFunc {
+	queryTime := evalMetrics.RulerQuerySeconds.WithLabelValues(userID)
+	querySeries := evalMetrics.RulerQuerySeries.WithLabelValues(userID)
+	querySample := evalMetrics.RulerQuerySamples.WithLabelValues(userID)
+	queryChunkBytes := evalMetrics.RulerQueryChunkBytes.WithLabelValues(userID)
+	queryDataBytes := evalMetrics.RulerQueryDataBytes.WithLabelValues(userID)
+
+	return func(ctx context.Context, qs string, t time.Time) (promql.Vector, error) {
+		queryStats, ctx := stats.ContextWithEmptyStats(ctx)
+		// If we've been passed a counter we want to record the wall time spent executing this request.
+		timer := prometheus.NewTimer(nil)
+
+		// Add request ID before logging so that it can be used in query stats logs.
+		ctx = requestmeta.ContextWithRequestId(ctx, uuid.NewString())
+
+		defer func() {
+			querySeconds := timer.ObserveDuration().Seconds()
+			queryTime.Add(querySeconds)
+			querySeries.Add(float64(queryStats.FetchedSeriesCount))
+			querySample.Add(float64(queryStats.FetchedSamplesCount))
+			queryChunkBytes.Add(float64(queryStats.FetchedChunkBytes))
+			queryDataBytes.Add(float64(queryStats.FetchedDataBytes))
+			// Log ruler query stats.
+			logMessage := []any{
+				"msg", "query stats",
+				"component", "ruler",
+			}
+			if origin := ctx.Value(promql.QueryOrigin{}); origin != nil {
+				queryLabels := origin.(map[string]any)
+				rgMap := queryLabels["ruleGroup"].(map[string]string)
+				logMessage = append(logMessage,
+					"rule_group", rgMap["name"],
+					"namespace", rgMap["file"],
+				)
+			}
+			ruleDetail := rules.FromOriginContext(ctx)
+			logMessage = append(logMessage,
+				"rule", ruleDetail.Name,
+				"rule_kind", ruleDetail.Kind,
+				"query", qs,
+				"cortex_ruler_query_seconds_total", querySeconds,
+				"query_wall_time_seconds", queryStats.WallTime,
+				"query_storage_wall_time_seconds", queryStats.QueryStorageWallTime,
+				"fetched_series_count", queryStats.FetchedSeriesCount,
+				"fetched_chunks_count", queryStats.FetchedChunksCount,
+				"fetched_samples_count", queryStats.FetchedSamplesCount,
+				"fetched_chunks_bytes", queryStats.FetchedChunkBytes,
+				"fetched_data_bytes", queryStats.FetchedDataBytes,
+			)
+			logMessage = append(logMessage, queryStats.LoadExtraFields()...)
+			level.Info(util_log.WithContext(ctx, logger)).Log(logMessage...)
+		}()
+
+		result, err := qf(ctx, qs, t)
+		return result, err
+	}
+}
+
+// This interface mimics rules.Manager API. Interface is used to simplify tests.
+type RulesManager interface {
+	// Starts rules manager. Blocks until Stop is called.
+	Run()
+
+	// Stops rules manager. (Unblocks Run.)
+	Stop()
+
+	// Updates rules manager state.
+	Update(interval time.Duration, files []string, externalLabels labels.Labels, externalURL string, ruleGroupPostProcessFunc rules.GroupEvalIterationFunc) error
+
+	// Returns current rules groups.
+	RuleGroups() []*rules.Group
+}
+
+// ManagerFactory is a function that creates new RulesManager for given user and notifier.Manager.
+type ManagerFactory func(ctx context.Context, userID string, notifier *notifier.Manager, logger log.Logger, frontendPool *client.Pool, reg prometheus.Registerer) (RulesManager, error)
+
+func DefaultTenantManagerFactory(cfg Config, p Pusher, q storage.Queryable, engine promql.QueryEngine, overrides RulesLimits, evalMetrics *RuleEvalMetrics, reg prometheus.Registerer) ManagerFactory {
+	// Wrap errors returned by Queryable to our wrapper, so that we can distinguish between those errors
+	// and errors returned by PromQL engine. Errors from Queryable can be either caused by user (limits) or internal errors.
+	// Errors from PromQL are always "user" errors.
+	q = querier.NewErrorTranslateQueryableWithFn(q, WrapQueryableErrors)
+	return func(ctx context.Context, userID string, notifier *notifier.Manager, logger log.Logger, frontendPool *client.Pool, reg prometheus.Registerer) (RulesManager, error) {
+		qfeClient, err := resolveFrontendClient(cfg.FrontendAddress, frontendPool)
+		if err != nil {
+			return nil, err
+		}
+
+		if qfeClient == nil && engine == nil {
+			return nil, fmt.Errorf("neither engine nor frontend client is configured for user %s", userID)
+		}
+
+		queryFunc := buildQueryFunc(engine, qfeClient, q, overrides, userID, cfg, evalMetrics, logger)
+		// We let the Prometheus rules manager control the context so that there is a chance
+		// for graceful shutdown of rules that are still in execution even in case the cortex context is canceled.
+		prometheusContext := user.InjectOrgID(context.WithoutCancel(ctx), userID)
+
+		// Resolve the per-tenant external URL for ManagerOptions.ExternalURL.
+		// This *url.URL is set once at manager creation and cannot be refreshed
+		// without recreating the manager. It powers the {{ externalURL }} and
+		// {{ pathPrefix }} template functions (not {{ $externalURL }}).
+		externalURL := cfg.ExternalURL.URL
+		if tenantURL := overrides.RulerExternalURL(userID); tenantURL != "" {
+			if parsed, err := url.Parse(tenantURL); err == nil {
+				externalURL = parsed
+			} else {
+				level.Warn(logger).Log("msg", "failed to parse per-tenant ruler external URL, using global", "user", userID, "url", tenantURL, "err", err)
+			}
+		}
+
+		// resolveExternalURL returns the per-tenant external URL string,
+		// re-reading from runtime config on each call so that changes
+		// take effect without restarting the ruler.
+		globalExternalURLStr := cfg.ExternalURL.String()
+		resolveExternalURL := func() string {
+			if tenantURL := overrides.RulerExternalURL(userID); tenantURL != "" {
+				return tenantURL
+			}
+			return globalExternalURLStr
+		}
+
+		// Cache for the parsed generator URL template. The closure below is called
+		// on every alert send; caching avoids re-parsing the template each time.
+		// The cache is invalidated if the template string changes via runtime config.
+		tmplCache := &generatorURLTemplateCache{}
+
+		return rules.NewManager(&rules.ManagerOptions{
+			Appendable: NewPusherAppendable(p, userID, overrides,
+				evalMetrics.TotalWritesVec.WithLabelValues(userID),
+				evalMetrics.FailedWritesVec.WithLabelValues(userID)),
+			Queryable:   q,
+			QueryFunc:   queryFunc,
+			Context:     prometheusContext,
+			ExternalURL: externalURL,
+			NotifyFunc: SendAlerts(notifier, func(expr string) string {
+				externalURLStr := resolveExternalURL()
+				tmplStr := overrides.RulerAlertGeneratorURLTemplate(userID)
+				if tmplStr == "" {
+					return externalURLStr + strutil.TableLinkForExpression(expr)
+				}
+				result, err := executeGeneratorURLTemplate(tmplCache, tmplStr, externalURLStr, expr)
+				if err != nil {
+					level.Warn(logger).Log("msg", "failed to execute generator URL template, falling back to prometheus format", "err", err)
+					return externalURLStr + strutil.TableLinkForExpression(expr)
+				}
+				return result
+			}),
+			Logger:                 util_log.GoKitLogToSlog(log.With(logger, "user", userID)),
+			Registerer:             reg,
+			OutageTolerance:        cfg.OutageTolerance,
+			ForGracePeriod:         cfg.ForGracePeriod,
+			ResendDelay:            cfg.ResendDelay,
+			ConcurrentEvalsEnabled: cfg.ConcurrentEvalsEnabled,
+			MaxConcurrentEvals:     cfg.MaxConcurrentEvals,
+			DefaultRuleQueryOffset: func() time.Duration {
+				return overrides.RulerQueryOffset(userID)
+			},
+			RestoreNewRuleGroups: cfg.EnableSharding,
+		}), nil
+	}
+}
+
+func resolveFrontendClient(addr string, pool *client.Pool) (*frontendClient, error) {
+	if addr == "" {
+		return nil, nil
+	}
+	c, err := pool.GetClientFor(addr)
+	if err != nil {
+		return nil, err
+	}
+	return c.(*frontendClient), nil
+}
+
+func buildQueryFunc(
+	engine promql.QueryEngine,
+	client *frontendClient,
+	q storage.Queryable,
+	overrides RulesLimits,
+	userID string,
+	cfg Config,
+	metrics *RuleEvalMetrics,
+	logger log.Logger,
+) rules.QueryFunc {
+	baseQueryFunc := engineQueryFunc(engine, client, q, overrides, userID, cfg.LookbackDelta)
+
+	// apply metric middleware
+	totalQueries := metrics.TotalQueriesVec.WithLabelValues(userID)
+	failedQueries := metrics.FailedQueriesVec.WithLabelValues(userID)
+	metricsFunc := metricsQueryFunc(baseQueryFunc, totalQueries, failedQueries)
+
+	// apply statistic middleware
+	if cfg.EnableQueryStats {
+		return recordAndReportRuleQueryMetrics(metricsFunc, userID, metrics, logger)
+	}
+	return metricsFunc
+}
+
+type QueryableError struct {
+	err error
+}
+
+func (q QueryableError) Unwrap() error {
+	return q.err
+}
+
+func (q QueryableError) Error() string {
+	return q.err.Error()
+}
+
+func WrapQueryableErrors(err error) error {
+	if err == nil {
+		return err
+	}
+
+	return QueryableError{err: err}
+}

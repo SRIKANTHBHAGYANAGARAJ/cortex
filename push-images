@@ -1,0 +1,81 @@
+#!/usr/bin/env bash
+
+set -o errexit
+set -o nounset
+set -o pipefail
+
+IMAGES=$(make images)
+IMAGE_TAG=${IMAGE_TAG:-$(./tools/image-tag)}
+QUAY_PREFIX=quay.io/
+NO_QUAY=
+
+usage() {
+    echo "$0 (-noquay)"
+    exit 2
+}
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        "-noquay")
+            NO_QUAY=true
+            shift 1
+            ;;
+        *)
+            usage
+            exit 2
+            ;;
+    esac
+done
+
+docker_cmd() {
+    retries=3
+    for ((i=1; i<=retries; i++)); do
+        set +o errexit
+        docker $@
+        res=$?
+        set -o errexit
+        if [ $res -eq 0 ]; then
+            break
+        fi
+        echo "Docker command failed. Retrying in 5 seconds..."
+        sleep 5
+    done
+    return $res
+}
+
+push_image() {
+    local image="$1"
+
+    for arch in amd64 arm64; do \
+      echo "Pushing ${image}-linux:${IMAGE_TAG}-$arch"
+      docker_cmd tag ${image}:${IMAGE_TAG}-$arch ${image}-linux:${IMAGE_TAG}-$arch
+      docker_cmd push ${image}-linux:${IMAGE_TAG}-$arch
+    done;
+
+    docker_cmd manifest create ${image}:${IMAGE_TAG} --amend ${image}-linux:${IMAGE_TAG}-amd64 --amend ${image}-linux:${IMAGE_TAG}-arm64
+    docker_cmd manifest push ${image}:${IMAGE_TAG}
+
+
+    if [ -n "${NO_QUAY}" ]; then
+        return
+    fi
+
+    # remove the quay prefix and push to docker hub
+    docker_hub_image=${image#$QUAY_PREFIX}
+    for arch in amd64 arm64; do \
+      docker_cmd tag ${image}:${IMAGE_TAG}-$arch ${docker_hub_image}-linux:${IMAGE_TAG}-$arch
+
+      echo "Pushing ${docker_hub_image}-linux:${IMAGE_TAG}-$arch"
+      docker_cmd push ${docker_hub_image}-linux:${IMAGE_TAG}-$arch
+    done;
+
+    docker_cmd manifest create ${docker_hub_image}:${IMAGE_TAG} --amend ${docker_hub_image}-linux:${IMAGE_TAG}-amd64 --amend ${docker_hub_image}-linux:${IMAGE_TAG}-arm64
+    docker_cmd manifest push ${docker_hub_image}:${IMAGE_TAG}
+}
+
+for image in ${IMAGES}; do
+    if [[ "$image" == *"build"* ]]; then
+        continue
+    fi
+    push_image "${image}"
+done

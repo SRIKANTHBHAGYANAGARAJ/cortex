@@ -1,0 +1,30 @@
+# To get started with Dependabot version updates, you'll need to specify which
+# package ecosystems to update and where the package manifests are located.
+# Please see the documentation for all configuration options:
+# https://docs.github.com/github/administering-a-repository/configuration-options-for-dependency-updates
+
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "daily"
+    groups:
+      actions-dependencies:
+        dependency-type: "production"
+    labels:
+      - "ci/cd"
+  - package-ecosystem: "gomod"
+    directories:
+      - "/"
+      - "/website"
+    groups:
+      go-dependencies:
+        exclude-patterns:
+          - "github.com/thanos-io/thanos"
+    ignore:
+      - dependency-name: "github.com/prometheus/prometheus"
+        versions:
+          - ">=0.300.0-beta.0"
+    schedule:
+      interval: "daily"

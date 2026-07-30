@@ -1,0 +1,113 @@
+package alertmanager
+
+import (
+	"bytes"
+	"io"
+	"net/http/httptest"
+	"testing"
+	"time"
+
+	"github.com/prometheus/alertmanager/cluster"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/common/promslog"
+	"github.com/stretchr/testify/require"
+)
+
+func TestStatusHandler_HTMLEscaping(t *testing.T) {
+	// Verify that html/template escapes XSS payloads in the status page.
+	xssPayload := `<script>alert("xss")</script>`
+
+	var buf bytes.Buffer
+	err := statusTemplate.Execute(&buf, struct {
+		ClusterInfo map[string]any
+	}{
+		ClusterInfo: map[string]any{
+			"self": map[string]any{
+				"Name": xssPayload,
+				"Addr": "127.0.0.1",
+				"Port": "9094",
+			},
+			"members": []map[string]any{
+				{"Name": xssPayload, "Addr": "127.0.0.1:9094"},
+			},
+		},
+	})
+	require.NoError(t, err)
+
+	content := buf.String()
+	require.NotContains(t, content, xssPayload, "XSS payload must be escaped by html/template")
+	require.Contains(t, content, "&lt;script&gt;", "HTML special characters must be escaped")
+}
+
+func TestMultitenantAlertmanager_GetStatusHandler(t *testing.T) {
+	ctx := t.Context()
+	var peer *cluster.Peer
+	{
+		logger := promslog.NewNopLogger()
+		createPeer := func(peers []string) (*cluster.Peer, error) {
+			return cluster.Create(
+				logger,
+				prometheus.NewRegistry(),
+				"127.0.0.1:0",
+				"",
+				peers,
+				true,
+				cluster.DefaultPushPullInterval,
+				cluster.DefaultGossipInterval,
+				cluster.DefaultTCPTimeout,
+				cluster.DefaultResolvePeersTimeout,
+				cluster.DefaultProbeTimeout,
+				cluster.DefaultProbeInterval,
+				nil,
+				false,
+				"",
+				"",
+			)
+		}
+
+		peer1, err := createPeer(nil)
+		require.NoError(t, err)
+		require.NotNil(t, peer1)
+		err = peer1.Join(cluster.DefaultReconnectInterval, cluster.DefaultReconnectTimeout)
+		require.NoError(t, err)
+		go peer1.Settle(ctx, 0*time.Second)
+		require.NoError(t, peer1.WaitReady(ctx))
+		require.Equal(t, peer1.Status(), "ready")
+
+		peer2, err := createPeer([]string{peer1.Self().Address()})
+		require.NoError(t, err)
+		require.NotNil(t, peer2)
+		err = peer2.Join(cluster.DefaultReconnectInterval, cluster.DefaultReconnectTimeout)
+		require.NoError(t, err)
+		go peer2.Settle(ctx, 0*time.Second)
+		peer = peer2
+	}
+
+	for _, tt := range []struct {
+		am        *MultitenantAlertmanager
+		content   string
+		nocontent string
+	}{
+		{
+			am:        &MultitenantAlertmanager{peer: nil},
+			content:   "Alertmanager gossip-based clustering is disabled.",
+			nocontent: "Node",
+		},
+		{
+			am:        &MultitenantAlertmanager{peer: peer},
+			content:   "Members",
+			nocontent: "No peers",
+		},
+	} {
+		req := httptest.NewRequest("GET", "http://alertmanager.cortex/status", nil)
+		w := httptest.NewRecorder()
+		tt.am.GetStatusHandler().ServeHTTP(w, req)
+
+		resp := w.Result()
+		require.Equal(t, 200, w.Code)
+		body, _ := io.ReadAll(resp.Body)
+		content := string(body)
+		require.Contains(t, content, tt.content)
+		require.NotContains(t, content, tt.nocontent)
+	}
+}
